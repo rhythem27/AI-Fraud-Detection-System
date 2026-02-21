@@ -10,3 +10,13 @@ numpy
 pillow
 matplotlib
 python-dotenv
+spacy
+thefuzz
+python-Levenshtein
+sqlalchemy
+psycopg2-binary
+timm
+scikit-image
+pdf2image
+PyPDF2
+grad-cam
