@@ -4,6 +4,7 @@ import base64
 import pandas as pd
 from PIL import Image
 from io import BytesIO
+import time
 
 # --- Page Configuration ---
 st.set_page_config(
@@ -139,20 +140,60 @@ def call_chat_api(question):
     except Exception as e:
         return {"error": str(e)}
 
+def check_status(task_id):
+    url = f"{backend_base}/status/{task_id}"
+    try:
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        return response.json()
+    except Exception as e:
+        return {"status": "ERROR", "error": str(e)}
+
 # --- UI Logic ---
 if mode == "Single Document":
     uploaded_file = st.file_uploader("Upload document for forensic analysis", type=["jpg", "jpeg", "png", "pdf"])
     
     if uploaded_file:
         if st.button("🚀 Analyze Document", use_container_width=True):
-            with st.spinner("🔍 Running Visual & NLP Checks..."):
-                files = {"file": (uploaded_file.name, uploaded_file.getvalue(), uploaded_file.type)}
-                result = call_api("/analyze", files)
+            files = {"file": (uploaded_file.name, uploaded_file.getvalue(), uploaded_file.type)}
+            init_res = call_api("/analyze", files)
+            
+            if "error" in init_res:
+                st.error(f"Backend Error: {init_res['error']}")
+            else:
+                task_id = init_res["task_id"]
+                status_container = st.empty()
+                progress_bar = st.progress(0)
                 
-                if "error" in result:
-                    st.error(f"Backend Error: {result['error']}")
-                else:
-                    st.success("Analysis Complete!")
+                with st.spinner("Models analyzing document in background..."):
+                    while True:
+                        status_res = check_status(task_id)
+                        
+                        if status_res["status"] == "SUCCESS":
+                            result = status_res["result"]
+                            status_container.success("Analysis Complete!")
+                            progress_bar.progress(100)
+                            time.sleep(1) # Brief pause to show completion
+                            status_container.empty()
+                            progress_bar.empty()
+                            break
+                        elif status_res["status"] == "FAILURE":
+                            st.error(f"Analysis Failed: {status_res.get('error')}")
+                            st.stop()
+                        elif status_res["status"] == "ERROR":
+                            st.error(f"Polling Error: {status_res.get('error')}")
+                            st.stop()
+                        else:
+                            # It's still processing
+                            msg = status_res.get("message", "Processing heavy ML models...")
+                            prog = status_res.get("progress", 0)
+                            status_container.info(f"⏳ {msg}")
+                            progress_bar.progress(prog)
+                        
+                        time.sleep(2)
+
+                    # Dashboard Layout (rendering with 'result' from the task)
+                    st.success("Analysis Results Loaded")
                     
                     # Dashboard Layout
                     m1, m2, m3 = st.columns(3)

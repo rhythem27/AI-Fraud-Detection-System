@@ -21,6 +21,9 @@ from services.kyc_validator import kyc_validator, ValidationResult
 from services.dl_detector import dl_detector, dl_image_to_base64
 from services.pdf_processor import pdf_processor, PDFMetadata
 from services.rag_service import rag_service, ChatResponse
+from services.tasks import analyze_document_task
+from core.celery_app import celery_app
+from celery.result import AsyncResult
 
 # Create tables on startup
 Base.metadata.create_all(bind=engine)
@@ -75,15 +78,18 @@ class BatchFraudResult(BaseModel):
 class CopilotRequest(BaseModel):
     question: str
 
-@app.post("/analyze", response_model=FraudResult)
+class TaskResponse(BaseModel):
+    task_id: str
+    status: str
+
+@app.post("/analyze", response_model=TaskResponse)
 async def analyze_document_simple(
     file: UploadFile = File(...),
     db: Session = Depends(get_db)
 ):
     """
-    Simplified analyze endpoint for local frontend testing without mandatory API keys.
+    Triggers an asynchronous Celery task to analyze the document.
     """
-    # 1. Save File
     file_id = str(uuid.uuid4())
     extension = os.path.splitext(file.filename)[1].lower()
     
@@ -94,57 +100,35 @@ async def analyze_document_simple(
     with open(saved_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
     
-    try:
-        # 2. PDF Handling
-        pdf_metadata = None
-        processing_path = saved_path
-        
-        if extension == '.pdf':
-            pdf_metadata = pdf_processor.extract_metadata(saved_path)
-            images = pdf_processor.convert_to_images(saved_path)
-            if not images:
-                raise HTTPException(status_code=500, detail="Failed to convert PDF to image.")
-            # Use the first page for analysis
-            temp_img_path = os.path.join(UPLOAD_DIR, f"{file_id}_page1.jpg")
-            images[0].save(temp_img_path, "JPEG")
-            processing_path = temp_img_path
+    # Trigger Celery task
+    task = analyze_document_task.delay(saved_path, file.filename)
+    
+    return TaskResponse(task_id=task.id, status="Processing")
 
-        # 3. OCR and Layout Analysis
-        ocr_results = ocr_service.extract_text(processing_path)
-        layout_score = layout_analyzer.analyze_spatial_consistency(ocr_results)
-        
-        # 4. Visual Fraud Detection (ELA + DL)
-        ela_image, ela_score = calculate_ela(processing_path)
-        heatmap_base64 = image_to_base64(ela_image)
-        
-        dl_image, dl_score = dl_detector.sliding_window_inference(processing_path)
-        dl_heatmap_base64 = dl_image_to_base64(dl_image)
-        
-        # 5. Final Scoring
-        final_score, classification = calculate_final_score(ela_score, layout_score, dl_score)
-        
-        # 6. NLP Entity Extraction
-        extracted_entities = entity_extractor.extract(ocr_results)
-        
-        return FraudResult(
-            filename=file.filename,
-            final_score=final_score,
-            classification=classification,
-            ela_score=round(float(ela_score), 4),
-            layout_score=round(float(layout_score), 4),
-            dl_score=round(float(dl_score), 4),
-            is_fraud=classification != "Authentic" or (pdf_metadata.is_suspicious if pdf_metadata else False),
-            ocr_data=ocr_results,
-            heatmap_base64=heatmap_base64,
-            dl_heatmap_base64=dl_heatmap_base64,
-            extracted_entities=extracted_entities,
-            pdf_metadata=pdf_metadata,
-            ai_explanation_64=dl_image_to_base64(dl_detector.generate_explanation(processing_path)) if dl_score > 0.2 else None
-        )
-    except Exception as e:
-        import traceback
-        print(traceback.format_exc())
-        raise HTTPException(status_code=500, detail=str(e))
+@app.get("/status/{task_id}")
+async def get_task_status(task_id: str):
+    """
+    Check the status of a Celery task and return results if finished.
+    """
+    task_result = AsyncResult(task_id, app=celery_app)
+    
+    if task_result.state == 'PENDING':
+        return {"status": "Processing", "progress": 0}
+    elif task_result.state == 'PROGRESS':
+        return {"status": "Processing", "progress": 50, "message": task_result.info.get('message', '')}
+    elif task_result.state == 'SUCCESS':
+        return {
+            "status": "SUCCESS",
+            "result": task_result.result
+        }
+    elif task_result.state == 'FAILURE':
+        return {
+            "status": "FAILURE",
+            "error": str(task_result.info)
+        }
+    
+    return {"status": task_result.state}
+
 
 @app.post("/upload", response_model=FraudResult)
 async def upload_document(
